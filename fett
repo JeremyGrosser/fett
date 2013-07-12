@@ -1,0 +1,300 @@
+#!/usr/bin/env python
+import collections
+import subprocess
+import argparse
+import logging
+import os.path
+import os
+import random
+import time
+import sys
+
+
+logging.basicConfig(
+        format='%(asctime)s %(name)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S')
+log = logging.getLogger('fett')
+
+
+class Fett(object):
+    def __init__(self):
+        self.rootdir = os.environ.get('FETT_ROOT', None) or '/var/lib/fett'
+
+    def main(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--debug', '-d', action='store_true')
+        parser.add_argument('--root', '-r',
+                help='Sets the fett root directory, overriding defaults and FETT_ROOT environment variable')
+        subparsers = parser.add_subparsers(dest='subparser')
+
+        parser_send = subparsers.add_parser('send')
+        parser_send.add_argument('name')
+        parser_send.add_argument('filename', help='path to output file or - for stdout')
+
+        parser_receive = subparsers.add_parser('receive')
+        parser_receive.add_argument('name')
+        parser_receive.add_argument('filename', help='path to a the input file or - for stdin')
+
+        parser_list = subparsers.add_parser('list', help='List available layers')
+        parser_list.add_argument('-l', help='Long listing', dest='long_list', action='store_true')
+
+        parser_destroy = subparsers.add_parser('destroy')
+        parser_destroy.add_argument('name')
+        parser_destroy.add_argument('--force', help='Do not prompt for confirmation', action='store_true')
+
+        parser_exec = subparsers.add_parser('exec')
+        parser_exec.add_argument('from_layer')
+        parser_exec.add_argument('command')
+        parser_exec.add_argument('--name', help='Name for the new layer', default=None)
+
+        args = parser.parse_args()
+
+        if args.debug:
+            log.setLevel(logging.DEBUG)
+
+        if args.root:
+            self.rootdir = args.root
+
+        fname = 'cmd_%s' % args.subparser
+        func = getattr(self, fname, None)
+        if not func:
+            log.critical('Unknown command: %s' % args.subparser)
+            return -1
+        else:
+            return func(args)
+
+    def _layer_path(self, layername):
+        if layername.find('/') != -1:
+            name = layername.rsplit('/', 1)[1]
+            log.warning('Layer names should not contain slashes, assuming %s means %s' % (layername, name))
+            layername = name
+        return os.path.join(self.rootdir, layername)
+
+    def cmd_send(self, args):
+        layerdir = self._layer_path(args.name)
+        if not os.path.exists(layerdir):
+            log.critical('%s does not exist, aborting.' % args.name)
+            return -1
+
+        ret = subprocess.call('tar -C %s -czpf %s .' % (layerdir, args.filename), shell=True)
+        if ret != 0:
+            log.error('Unable to tar %s' % args.name)
+            return -1
+        return 0
+
+    def cmd_receive(self, args):
+        layerdir = self._layer_path(args.name)
+        if os.path.exists(layerdir):
+            log.critical('%s already exists, aborting.' % args.name)
+            return -1
+
+        try:
+            os.makedirs(layerdir)
+        except os.error as e:
+            log.critical('Unable to create layer directory %s: %s' % (layerdir, str(e)))
+            return -1
+
+        ret = subprocess.call('tar -C %s -xzpf %s .' % (layerdir, args.filename), shell=True)
+        if ret != 0:
+            log.error('Unable to untar from %s' % args.filename)
+            return -1
+        return 0
+
+    def cmd_list(self, args):
+        try:
+            dirs = os.listdir(self.rootdir)
+        except os.error as e:
+            log.critical('Unable to list %s: %s' % (self.rootdir, str(e)))
+            return -1
+
+        ret = []
+
+        dirs = (os.path.abspath(os.path.join(self.rootdir, x)) for x in dirs if not x.startswith('.'))
+        dirs = ((x, os.stat(x)) for x in dirs if os.path.isdir(x))
+        for dirpath, st in sorted(dirs, key=lambda x: x[1].st_ctime, reverse=True):
+            dirname = os.path.basename(dirpath)
+            if args.long_list:
+                size, mtime = fsinfo(dirpath)
+                if mtime != 0:
+                    mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mtime))
+                else:
+                    mtime = '-'
+                ret.append((dirname, size, mtime, dirpath))
+            else:
+                ret.append(dirname)
+        
+        if args.long_list:
+            print_columns(ret, max_length=40, headers=('NAME', 'SIZE', 'MTIME', 'PATH'))
+        else:
+            for name in ret:
+                print name
+        return 0
+
+    def cmd_destroy(self, args):
+        layerdir = self._layer_path(args.name)
+        if not os.path.exists(layerdir):
+            log.critical('%s does not exist' % layerdir)
+            return -1
+
+        if not args.force:
+            sys.stdout.write('Are you sure you want to destroy %s (yes/no)? ' % args.name)
+            answer = sys.stdin.readline().rstrip('\r\n')
+            if answer != 'yes':
+                sys.stdout.write('No.\n')
+                return -1
+        return subprocess.call('rm -rf %s' % layerdir, shell=True)
+
+    def cmd_exec(self, args):
+        overlaydir = '%s/%s' % (self.rootdir, args.from_layer)
+        if not os.path.exists(overlaydir):
+            log.critical('%s does not exist' % args.from_layer)
+            return -1
+
+        if args.name is None:
+            name = random_name()
+        else:
+            name = args.name
+
+        layerdir = self._layer_path(name)
+        if not os.path.exists(layerdir):
+            try:
+                log.info('Creating new empty layer %s' % name)
+                os.makedirs(layerdir)
+            except os.error as e:
+                log.critical('Unable to create %s: %s' % (layerdir, str(e)))
+                return -1
+
+        mountpoint = os.path.join(self.rootdir, '.mounts', name)
+        mountpoint = self.overlay_mount(overlaydir, layerdir, mountpoint=mountpoint)
+        if mountpoint is None:
+            log.critical('Unable to setup overlay mount')
+            return -1
+
+        pid = os.fork()
+        if pid == 0:
+            # child: chroot and exec
+            try:
+                log.debug('chroot(%r)' % mountpoint)
+                os.chroot(mountpoint)
+                os.chdir('/')
+            except os.error as e:
+                log.critical('Unable to chroot to %s: %s' % (mountpoint, str(e)))
+                return -1
+        
+            cmd = args.command.split(' ')
+            env = {}
+            try:
+                log.debug('execve(%r, %r, %r)' % (cmd[0], cmd, env))
+                os.execve(cmd[0], cmd, env)
+                log.error('execv returned. This should never happen')
+                return -1
+            except os.error as e:
+                log.critical('Unable to call execve(%r, %r, %r): %s' % (cmd[0], cmd, env, str(e)))
+                return -1
+        else:
+            # parent: wait for child to exit, unmount everything
+            log.debug('Forked PID %s' % pid)
+            exitpid, status = os.wait()
+            ret = (status >> 16)
+            signal = (status & 0x00FF)
+            log.debug('PID %i exited with signal=%i code=%i' % (exitpid, signal, ret))
+            return self.overlay_unmount(mountpoint)
+
+    def overlay_mount(self, lower_dir, upper_dir, mountpoint=None):
+        if mountpoint is None:
+            mountpoint = os.path.join(self.rootdir, '.mounts', random_name())
+
+        if not os.path.exists(mountpoint):
+            try:
+                os.makedirs(mountpoint)
+            except os.error as e:
+                log.critical('Unable to create %s: %s' % (mountpoint, str(e)))
+                return None
+        
+        if os.path.ismount(mountpoint):
+            log.critical('%s is already mounted' % mountpoint)
+            return None
+
+        ret = subprocess.call('mount -t overlayfs -o rw,lowerdir=%s,upperdir=%s none %s' % 
+                (lower_dir, upper_dir, mountpoint), shell=True)
+        if ret != 0:
+            log.error('Unable to mount %s' % mountpoint)
+            return None
+        
+        ret = subprocess.call('mount -t proc none %s/proc' % mountpoint, shell=True)
+        if ret != 0:
+            log.error('Unable to mount %s/proc' % mountpoint)
+            return None
+        
+        ret = subprocess.call('mount -o bind /dev %s/dev' % mountpoint, shell=True)
+        if ret != 0:
+            log.error('Unable to mount %s/dev' % mountpoint)
+            return None
+        return mountpoint
+
+    def overlay_unmount(self, mountpoint):
+        ret = subprocess.call('umount %s/dev' % mountpoint, shell=True)
+        if ret != 0:
+            log.error('Unable to unmount %s/dev' % mountpoint)
+            return ret
+        ret = subprocess.call('umount %s/proc' % mountpoint, shell=True)
+        if ret != 0:
+            log.error('Unable to unmount %s/proc' % mountpoint)
+            return ret
+        ret = subprocess.call('umount %s' % mountpoint, shell=True)
+        if ret != 0:
+            log.error('Unable to unmount %s' % mountpoint)
+            return ret
+
+        try:
+            os.rmdir(mountpoint)
+        except os.error as e:
+            log.error('Unable to delete overlay mount point %s: %s' % (mountpoint, str(e)))
+            return -1
+
+        return 0
+
+def random_name():
+    return '%x' % random.getrandbits(32)
+
+def fsinfo(path):
+    total_bytes = 0
+    last_modified = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        for filename in filenames:
+            try:
+                path = os.path.join(dirpath, filename)
+                st = os.lstat(path)
+                total_bytes += st.st_size
+                if st.st_mtime > last_modified:
+                    last_modified = st.st_mtime
+            except os.error:
+                pass
+    return (total_bytes, last_modified)
+
+
+def print_columns(seq, max_length=None, padding=2, headers=None):
+    seq = [[str(y) for y in x] for x in seq]
+    width = collections.defaultdict(int)
+    for row in seq:
+        for i, col in enumerate(row):
+            if len(col) > width[i]:
+                width[i] = len(col)
+
+    if max_length is not None:
+        for i, v in width.items():
+            if v > max_length:
+                width[i] = max_length
+
+    if headers:
+        seq.insert(0, headers)
+
+    for row in seq:
+        for i, col in enumerate(row):
+            sys.stdout.write(col.ljust(width[i] + padding, ' '))
+        sys.stdout.write('\n')
+
+
+if __name__ == '__main__':
+    fett = Fett()
+    sys.exit(fett.main())
