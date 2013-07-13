@@ -1,4 +1,10 @@
 #!/usr/bin/env python
+# Fett
+# A tool for building jails with clone(2) and overlayfs
+#
+# Copyright 2013 Uber Technologies, Inc.
+# MIT License
+
 import collections
 import subprocess
 import argparse
@@ -9,11 +15,129 @@ import random
 import time
 import sys
 
+import fett
+
 
 logging.basicConfig(
         format='%(asctime)s %(name)s %(levelname)s %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger('fett')
+log.setLevel(logging.DEBUG)
+
+class Layer(object):
+    def __init__(self, rootdir, name):
+        self.rootdir = rootdir
+        self.name = name
+
+    @property
+    def path(self):
+        path = os.path.join(self.rootdir, self.name)
+        assert path.startswith(self.rootdir)
+        return path
+
+    def exists(self):
+        return os.path.exists(self.path)
+    
+    def read_metadata(self):
+        try:
+            with open(os.path.join(self.path, '.fettinfo'), 'r') as fd:
+                meta = [x.rstrip('\n').split('=', 1) for x in fd.readlines() if not x.startswith('#')]
+                meta = dict(meta)
+                return meta
+        except IOError as e:
+            return None
+
+    def write_metadata(self, meta):
+        with open(os.path.join(self.path, '.fettinfo'), 'w') as fd:
+            for key, value in meta.iteritems():
+                fd.write('%s=%s\n' % (key, value))
+            fd.flush()
+            fd.close()
+
+    def is_root_layer(self):
+        meta = self.read_metadata()
+        if meta is None:
+            return True
+        else:
+            return False
+
+    @property
+    def parent(self):
+        meta = self.read_metadata()
+        if meta:
+            parent = meta['parent_layer_name']
+            return Layer(self.rootdir, parent)
+        else:
+            return None
+    
+    def create(self, parent_layer=None):
+        try:
+            os.makedirs(self.path)
+        except os.error as e:
+            log.critical('Unable to create layer directory %s: %s' % (self.path, str(e)))
+            return -1
+
+        if parent_layer is not None:
+            self.write_metadata({
+                'parent_layer_name': parent_layer.name,
+            })
+        return 0
+
+    def destroy(self):
+        return subprocess.call('rm -rf %s' % self.path, shell=True)
+
+    def mount(self):
+        if self.is_root_layer():
+            # don't mount non-overlay layers, just use them directly as read-only lowerdir
+            return self.path
+        
+        mountpoint = os.path.join(self.rootdir, '.mounts', self.name)
+        log.debug('Mount layer %s at %s' % (self.path, mountpoint))
+        if ensure_directory(mountpoint) != 0:
+            return None
+
+        if not self.parent.exists():
+            log.critical('Parent layer of %s, %s does not exist' % (self.name, parent.name))
+            return None
+
+        parent_mountpoint = self.parent.mount()
+        if parent_mountpoint is None:
+            return None
+
+        if os.path.ismount(mountpoint):
+            log.critical('%s is already mounted' % mountpoint)
+            return None
+
+        ret = subprocess.call('mount -t overlayfs -o rw,lowerdir=%s,upperdir=%s none %s' % 
+                (parent_mountpoint, self.path, mountpoint), shell=True)
+        if ret != 0:
+            log.error('Unable to mount %s' % mountpoint)
+            return None
+        return mountpoint
+
+    
+    def unmount(self):
+        if self.is_root_layer():
+            return 0
+        
+        mountpoint = os.path.join(self.rootdir, '.mounts', self.name)
+        try:
+            log.debug('umount %s' % mountpoint)
+            fett.umount(mountpoint)
+        except os.error as e:
+            log.critical('Unable to unmount %s' % mountpoint)
+            return -1
+
+        try:
+            os.rmdir(mountpoint)
+        except os.error as e:
+            log.error('Unable to delete overlay mount point %s: %s' % (mountpoint, str(e)))
+            return -1
+
+        if self.parent is not None:
+            return self.parent.unmount()
+        else:
+            return 0
 
 
 class Fett(object):
@@ -63,41 +187,38 @@ class Fett(object):
         else:
             return func(args)
 
-    def _layer_path(self, layername):
-        if layername.find('/') != -1:
-            name = layername.rsplit('/', 1)[1]
-            log.warning('Layer names should not contain slashes, assuming %s means %s' % (layername, name))
-            layername = name
-        return os.path.join(self.rootdir, layername)
-
     def cmd_send(self, args):
-        layerdir = self._layer_path(args.name)
-        if not os.path.exists(layerdir):
+        layer = Layer(self.rootdir, args.name)
+
+        if not layer.exists():
             log.critical('%s does not exist, aborting.' % args.name)
             return -1
 
-        ret = subprocess.call('tar -C %s -czpf %s .' % (layerdir, args.filename), shell=True)
+        mountpoint = layer.mount()
+        if mountpoint is None:
+            return -1
+
+        ret = subprocess.call('tar -C %s -czpf %s .' % (mountpoint, args.filename), shell=True)
         if ret != 0:
             log.error('Unable to tar %s' % args.name)
             return -1
-        return 0
+
+        return layer.unmount()
 
     def cmd_receive(self, args):
-        layerdir = self._layer_path(args.name)
-        if os.path.exists(layerdir):
+        layer = Layer(self.rootdir, args.name)
+        if layer.exists():
             log.critical('%s already exists, aborting.' % args.name)
             return -1
 
-        try:
-            os.makedirs(layerdir)
-        except os.error as e:
-            log.critical('Unable to create layer directory %s: %s' % (layerdir, str(e)))
-            return -1
+        ret = layer.create()
+        if ret != 0:
+            return ret
 
-        ret = subprocess.call('tar -C %s -xzpf %s .' % (layerdir, args.filename), shell=True)
+        ret = subprocess.call('tar -C %s -xzpf %s .' % (layer.path, args.filename), shell=True)
         if ret != 0:
             log.error('Unable to untar from %s' % args.filename)
-            return -1
+            return ret
         return 0
 
     def cmd_list(self, args):
@@ -131,8 +252,8 @@ class Fett(object):
         return 0
 
     def cmd_destroy(self, args):
-        layerdir = self._layer_path(args.name)
-        if not os.path.exists(layerdir):
+        layer = Layer(self.rootdir, args.name)
+        if not layer.exists():
             log.critical('%s does not exist' % layerdir)
             return -1
 
@@ -142,120 +263,101 @@ class Fett(object):
             if answer != 'yes':
                 sys.stdout.write('No.\n')
                 return -1
-        return subprocess.call('rm -rf %s' % layerdir, shell=True)
+        return layer.destroy()
 
-    def cmd_exec(self, args):
-        overlaydir = '%s/%s' % (self.rootdir, args.from_layer)
-        if not os.path.exists(overlaydir):
-            log.critical('%s does not exist' % args.from_layer)
+
+    def _child_thread(self, name, mountpoint, command):
+        log.debug('Initializing child thread %s' % name)
+
+        fett.mount('/dev', '%s/dev' % mountpoint, 'none', fett.MS_BIND, '')
+
+        try:
+            log.debug('chroot(%r)' % mountpoint)
+            os.chroot(mountpoint)
+            os.chdir('/')
+        except os.error as e:
+            log.critical('Unable to chroot to %s: %s' % (mountpoint, str(e)))
             return -1
 
+        fett.mount('none', '/proc', 'proc', 0, '')
+        fett.mount('none', '/sys', 'sysfs', 0, '')
+
+        try:
+            os.remove('/etc/mtab')
+        except os.error as e:
+            pass
+        
+        try:
+            fett.sethostname(name)
+        except os.error as e:
+            log.critical('Unable to set hostname %s: %s' % (name, str(e)))
+            return -1
+
+        cmd = command.split(' ')
+        env = {
+            'TERM': 'xterm',
+            'HOME': '/',
+        }
+        try:
+            log.debug('execve(%r, %r, %r)' % (cmd[0], cmd, env))
+            os.execve(cmd[0], cmd, env)
+            log.error('execve returned. This should never happen')
+            return -1
+        except os.error as e:
+            log.critical('Unable to call execve(%r, %r, %r): %s' % (cmd[0], cmd, env, str(e)))
+            return -1
+
+
+    def cmd_exec(self, args):
         if args.name is None:
             name = random_name()
         else:
             name = args.name
 
-        layerdir = self._layer_path(name)
-        if not os.path.exists(layerdir):
-            try:
-                log.info('Creating new empty layer %s' % name)
-                os.makedirs(layerdir)
-            except os.error as e:
-                log.critical('Unable to create %s: %s' % (layerdir, str(e)))
-                return -1
+        parent_layer = Layer(self.rootdir, args.from_layer)
+        if not parent_layer.exists():
+            log.critical('Parent layer %s does not exist' % parent_layer.name)
+            return -1
 
-        mountpoint = os.path.join(self.rootdir, '.mounts', name)
-        mountpoint = self.overlay_mount(overlaydir, layerdir, mountpoint=mountpoint)
+        layer = Layer(self.rootdir, name)
+        if not layer.exists():
+            layer.create(parent_layer)
+
+        mountpoint = layer.mount()
         if mountpoint is None:
             log.critical('Unable to setup overlay mount')
             return -1
-
-        pid = os.fork()
-        if pid == 0:
-            # child: chroot and exec
-            try:
-                log.debug('chroot(%r)' % mountpoint)
-                os.chroot(mountpoint)
-                os.chdir('/')
-            except os.error as e:
-                log.critical('Unable to chroot to %s: %s' % (mountpoint, str(e)))
-                return -1
         
-            cmd = args.command.split(' ')
-            env = {}
-            try:
-                log.debug('execve(%r, %r, %r)' % (cmd[0], cmd, env))
-                os.execve(cmd[0], cmd, env)
-                log.error('execv returned. This should never happen')
-                return -1
-            except os.error as e:
-                log.critical('Unable to call execve(%r, %r, %r): %s' % (cmd[0], cmd, env, str(e)))
-                return -1
-        else:
-            # parent: wait for child to exit, unmount everything
-            log.debug('Forked PID %s' % pid)
-            exitpid, status = os.wait()
-            ret = (status >> 16)
-            signal = (status & 0x00FF)
-            log.debug('PID %i exited with signal=%i code=%i' % (exitpid, signal, ret))
-            return self.overlay_unmount(mountpoint)
+        flags = (
+            #fett.CLONE_FILES |
+            fett.CLONE_NEWNS |
+            fett.CLONE_NEWPID |
+            fett.CLONE_NEWUTS |
+            fett.CLONE_NEWNET |
+            fett.CLONE_VFORK |
+            fett.CLONE_VM |
+            fett.SIGCHLD
+        )
+        pid = fett.clone(self._child_thread, (name, mountpoint, args.command), flags, 65536)
+        log.debug('Cloned PID %i' % pid)
+        #fett.unshare(fett.CLONE_NEWNS | fett.CLONE_NEWUTS | fett.CLONE_NEWNET)
+            
+        #pid = os.fork()
+        # parent: wait for child to exit, unmount everything
+        log.debug('Forked PID %i' % pid)
+        #ret = os.waitpid(pid, 0)
+        #log.debug('waitpid returned %i' % ret)
+        exitpid, status = os.wait()
+        ret = (status >> 16)
+        signal = (status & 0x00FF)
+        log.debug('PID %i exited with signal=%i code=%i' % (exitpid, signal, ret))
+        os.chdir('/')
+        return layer.unmount()
 
-    def overlay_mount(self, lower_dir, upper_dir, mountpoint=None):
-        if mountpoint is None:
-            mountpoint = os.path.join(self.rootdir, '.mounts', random_name())
-
-        if not os.path.exists(mountpoint):
-            try:
-                os.makedirs(mountpoint)
-            except os.error as e:
-                log.critical('Unable to create %s: %s' % (mountpoint, str(e)))
-                return None
-        
-        if os.path.ismount(mountpoint):
-            log.critical('%s is already mounted' % mountpoint)
-            return None
-
-        ret = subprocess.call('mount -t overlayfs -o rw,lowerdir=%s,upperdir=%s none %s' % 
-                (lower_dir, upper_dir, mountpoint), shell=True)
-        if ret != 0:
-            log.error('Unable to mount %s' % mountpoint)
-            return None
-        
-        ret = subprocess.call('mount -t proc none %s/proc' % mountpoint, shell=True)
-        if ret != 0:
-            log.error('Unable to mount %s/proc' % mountpoint)
-            return None
-        
-        ret = subprocess.call('mount -o bind /dev %s/dev' % mountpoint, shell=True)
-        if ret != 0:
-            log.error('Unable to mount %s/dev' % mountpoint)
-            return None
-        return mountpoint
-
-    def overlay_unmount(self, mountpoint):
-        ret = subprocess.call('umount %s/dev' % mountpoint, shell=True)
-        if ret != 0:
-            log.error('Unable to unmount %s/dev' % mountpoint)
-            return ret
-        ret = subprocess.call('umount %s/proc' % mountpoint, shell=True)
-        if ret != 0:
-            log.error('Unable to unmount %s/proc' % mountpoint)
-            return ret
-        ret = subprocess.call('umount %s' % mountpoint, shell=True)
-        if ret != 0:
-            log.error('Unable to unmount %s' % mountpoint)
-            return ret
-
-        try:
-            os.rmdir(mountpoint)
-        except os.error as e:
-            log.error('Unable to delete overlay mount point %s: %s' % (mountpoint, str(e)))
-            return -1
-
-        return 0
 
 def random_name():
-    return '%x' % random.getrandbits(32)
+    return '%04x' % random.getrandbits(16)
+
 
 def fsinfo(path):
     total_bytes = 0
@@ -271,6 +373,17 @@ def fsinfo(path):
             except os.error:
                 pass
     return (total_bytes, last_modified)
+
+
+def ensure_directory(path):
+    if not os.path.exists(path):
+        try:
+            log.info('Creating directory %s' % path)
+            os.makedirs(path)
+        except os.error as e:
+            log.critical('Unable to create %s: %s' % (path, str(e)))
+            return -1
+    return 0
 
 
 def print_columns(seq, max_length=None, padding=2, headers=None):
@@ -296,5 +409,5 @@ def print_columns(seq, max_length=None, padding=2, headers=None):
 
 
 if __name__ == '__main__':
-    fett = Fett()
-    sys.exit(fett.main())
+    maincmd = Fett()
+    sys.exit(maincmd.main())
