@@ -22,7 +22,7 @@ logging.basicConfig(
         format='%(asctime)s %(name)s %(levelname)s %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger('fett')
-log.setLevel(logging.DEBUG)
+
 
 class Layer(object):
     def __init__(self, rootdir, name):
@@ -71,6 +71,9 @@ class Layer(object):
             return None
     
     def create(self, parent_layer=None):
+        '''
+        Create an empty directory for this layer and write out a metadata (.fettinfo) file
+        '''
         try:
             os.makedirs(self.path)
         except os.error as e:
@@ -84,9 +87,15 @@ class Layer(object):
         return 0
 
     def destroy(self):
+        '''
+        Nuke it from orbit
+        '''
         return subprocess.call('rm -rf %s' % self.path, shell=True)
 
     def mount(self):
+        '''
+        Recursively mount overlayfs until we find a root layer
+        '''
         if self.is_root_layer():
             # don't mount non-overlay layers, just use them directly as read-only lowerdir
             return self.path
@@ -117,6 +126,9 @@ class Layer(object):
 
     
     def unmount(self):
+        '''
+        Recursively unmount overlayfs until we find a root layer
+        '''
         if self.is_root_layer():
             return 0
         
@@ -145,28 +157,33 @@ class Fett(object):
         self.rootdir = os.environ.get('FETT_ROOT', None) or '/var/lib/fett'
 
     def main(self):
+        '''
+        Entry point for the fett CLI. Uses argparse to implement subcommands
+        and options parsing, then delegates control to cmd_ methods to
+        perform the logic behind each command.
+        '''
         parser = argparse.ArgumentParser()
         parser.add_argument('--debug', '-d', action='store_true')
         parser.add_argument('--root', '-r',
                 help='Sets the fett root directory, overriding defaults and FETT_ROOT environment variable')
         subparsers = parser.add_subparsers(dest='subparser')
 
-        parser_send = subparsers.add_parser('send')
+        parser_send = subparsers.add_parser('send', help='Tar up a layer and write it to the given file')
         parser_send.add_argument('name')
         parser_send.add_argument('filename', help='path to output file or - for stdout')
 
-        parser_receive = subparsers.add_parser('receive')
+        parser_receive = subparsers.add_parser('receive', help='Read in a gzipped tar archive and create a new layer from it')
         parser_receive.add_argument('name')
         parser_receive.add_argument('filename', help='path to a the input file or - for stdin')
 
         parser_list = subparsers.add_parser('list', help='List available layers')
         parser_list.add_argument('-l', help='Long listing', dest='long_list', action='store_true')
 
-        parser_destroy = subparsers.add_parser('destroy')
+        parser_destroy = subparsers.add_parser('destroy', help='Completely delete a layer. This will break any layers built on top of it.')
         parser_destroy.add_argument('name')
         parser_destroy.add_argument('--force', help='Do not prompt for confirmation', action='store_true')
 
-        parser_exec = subparsers.add_parser('exec')
+        parser_exec = subparsers.add_parser('exec', help='Switch to a new fs/pid/uts namespace, chroot into the layer, and exec a command. If a name is not specified, a new layer with a random name is created.')
         parser_exec.add_argument('from_layer')
         parser_exec.add_argument('command')
         parser_exec.add_argument('--name', help='Name for the new layer', default=None)
