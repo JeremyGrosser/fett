@@ -1,0 +1,70 @@
+Project:      Fett
+Description:  A tool for building jails with clone(2) and overlayfs
+License:      MIT
+
+Why do I need this?
+-------------------
+As the Linux kernel has gained a more complete implementation of
+namespaces, new use cases have arisen that were not previously
+possible. Existing tools like LXC and OpenVZ are fairly focused on
+providing what is essentially a secure chroot and have struggled to
+expand their configuration and userspace tools to support more complex
+environments in a way that keeps them easy to use.
+
+Fett is an attempt to replicate a subset of the functionality of LXC
+with a minimal amount of effort and a well-documented and thorough
+command line interface. Above all, simplicity of implementation code
+is the primary goal of Fett, so that it may be patched and extended
+without wading through a large codebase.
+
+How do I use it?
+----------------
+- Create a root filesystem tarball through some existing means, like
+  debootstrap(8)
+- Import the tarball as a root image:
+  `fett receive precise /path/to/precise.tar.gz`
+- Create a new layer by executing a command
+  `fett exec --name nethack precise "apt-get install -y nethack-console"`
+- Run a command using the same layer you just created
+  `fett exec --name nethack precise "nethack"`
+
+How does it work?
+-----------------
+Upon running "fett exec", a random name is chosen for the layer. If a
+name is specified on the command line with the --name argument, that
+is used instead. If a layer with that name does not exist, it is
+created (an empty directory) with a .fettinfo file noting the parent
+layer specified on the command line. An overlayfs mount is created
+using the parent as lowerdir and new layer as upperdir. If the parent
+layer contains a .fettinfo file, this mount process is repeated
+recursively until a root layer (one without a .fettinfo) is
+encountered.
+
+Once the overlayfs is mounted, the clone() syscall is used to create a
+new thread in a new filesystem, PID, UTS, and network namespace. The
+new thread bind mounts /dev into the overlayfs directory and chroots
+into it. Once chrooted, /proc and /sys are mounted and the hostname is
+set to the layer name. Finally, execve() is called with the command
+and arguments passed on the command line. The parent thread calls
+wait() and blocks until the child process exits, at which point it
+unmounts the overlayfs and exits cleanly.
+
+How do I hack on it?
+--------------------
+`fett.c` is a Python C extension that exposes several syscalls not
+normally available via the Python standard library. As much as
+possible, this module has minimal functionality beyond converting
+types and calling methods.
+
+`fett` is a Python script that defines a Layer class and a Fett class.
+Layer is a high level abstraction of overlayfs semantics and the layer
+directory structure. Fett is a collection of methods prefixed with
+`cmd_` that are called depending on which subcommand was specified on
+the command line. These commands should do little more than manipulate
+Layer objects and call syscalls where necessary.
+
+I still don't get it
+--------------------
+That's fine. This project is still in it's infancy and if you need
+something reliable and feature complete, LXC, OpenVZ, and Docker are
+all quite nice.
